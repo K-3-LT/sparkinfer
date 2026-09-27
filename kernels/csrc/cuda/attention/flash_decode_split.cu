@@ -1206,7 +1206,9 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
     }
     // PV's M tile is padded to 16 rows. Keep its unused probability rows zero so
     // the softmax below only computes the GQA query rows retained by the output.
-    for (int i = GQA * 128 + tid; i < 16 * 128; i += blockDim.x) s_pi[i] = 0;
+    if constexpr (HEAD_DIM == 256 && GQA == 6) {
+        for (int i = GQA * 128 + tid; i < 16 * 128; i += blockDim.x) s_pi[i] = 0;
+    }
     for (int i = tid; i < GQA * HEAD_DIM; i += blockDim.x) s_o[i] = 0.f;
     if (tid < 16) { s_m[tid] = -1e30f; s_l[tid] = 0.f; }
     __syncthreads();
@@ -1286,7 +1288,9 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
         #pragma unroll
         for (int rr = 0; rr < 2; rr++) {
             const int r = warp * 2 + rr;
-            if (r >= GQA) continue;
+            if constexpr (HEAD_DIM == 256 && GQA == 6) {
+                if (r >= GQA) continue;
+            }
             // Cache this lane's 4 scaled QK scores (t = lane + u*32) once, reuse for max AND exp —
             // avoids reading s_si + re-applying the 3 scales twice. Invalid/masked positions get the
             // -inf sentinel so they drop out of the max and yield p=0 in the exp (no s_vs garbage read).
