@@ -1216,6 +1216,16 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
     for (int g0 = 0; g0 < nblk; g0 += 8) {
         const int gblk = min(8, nblk - g0);
         const int gbase = (first_blk + g0) * 16;
+        if constexpr (HEAD_DIM == 256 && GQA == 6) {
+            // Warm V's cache lines while QK is computed; this is only a cache hint.
+            const int token = tid >> 1;
+            if (token < gblk * 16) {
+                const int pb = block_table[seq * max_blocks + first_blk + g0 + token / 16];
+                const signed char* vp = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM
+                                       + (token & 15) * KVLD + (tid & 1) * 128;
+                asm volatile("prefetch.global.L2 [%0];" :: "l"(vp));
+            }
+        }
         for (int j = tid; j < gblk * 16; j += blockDim.x) {   // stage per-token K/V scales for the group
             const int lb = first_blk + g0 + j / 16, within = j & 15;
             const int pb = block_table[seq * max_blocks + lb];
@@ -1234,11 +1244,28 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
             fragment<matrix_b, 16, 16, 16, signed char, col_major> bf;
             fragment<accumulator, 16, 16, 16, int> cf;
             fill_fragment(cf, 0);
-            #pragma unroll
-            for (int ks = 0; ks < KH; ks++) {
-                load_matrix_sync(af, s_qi + ks * 16, HEAD_DIM);
-                load_matrix_sync(bf, kb + ks * 16, KVLD);
+            if constexpr (HEAD_DIM == 256 && GQA == 6) {
+                fragment<matrix_a, 16, 16, 16, signed char, row_major> next_af;
+                fragment<matrix_b, 16, 16, 16, signed char, col_major> next_bf;
+                load_matrix_sync(af, s_qi, HEAD_DIM);
+                load_matrix_sync(bf, kb, KVLD);
+                #pragma unroll
+                for (int ks = 1; ks < KH; ks++) {
+                    // Issue the next tile's loads before consuming the preceding tile.
+                    load_matrix_sync(next_af, s_qi + ks * 16, HEAD_DIM);
+                    load_matrix_sync(next_bf, kb + ks * 16, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                    af = next_af;
+                    bf = next_bf;
+                }
                 mma_sync(cf, af, bf, cf);
+            } else {
+                #pragma unroll
+                for (int ks = 0; ks < KH; ks++) {
+                    load_matrix_sync(af, s_qi + ks * 16, HEAD_DIM);
+                    load_matrix_sync(bf, kb + ks * 16, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                }
             }
             // ldm = 128: the QK result is a [16 q-rows x up-to-128 tokens] score tile, so its row
             // stride is the group token width (128), not HEAD_DIM — the two only coincide at
@@ -1306,14 +1333,33 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
         for (int dh = 0; dh < HEAD_DIM; dh += 128) {
             fragment<accumulator, 16, 16, 16, int> cf;
             fill_fragment(cf, 0);
-            for (int ks = 0; ks < gblk; ks++) {
-                const int pb = block_table[seq * max_blocks + first_blk + g0 + ks];
-                const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
-                fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
-                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
-                load_matrix_sync(af, s_pi + ks * 16, 128);
-                load_matrix_sync(bf, vb, KVLD);
+            if constexpr (HEAD_DIM == 256 && GQA == 6) {
+                fragment<matrix_a, 16, 16, 16, signed char, row_major> af, next_af;
+                fragment<matrix_b, 16, 16, 16, signed char, row_major> bf, next_bf;
+                const int pb0 = block_table[seq * max_blocks + first_blk + g0];
+                const signed char* vb0 = v_pool + ((size_t)pb0 * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
+                load_matrix_sync(af, s_pi, 128);
+                load_matrix_sync(bf, vb0, KVLD);
+                for (int ks = 1; ks < gblk; ks++) {
+                    const int pb = block_table[seq * max_blocks + first_blk + g0 + ks];
+                    const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
+                    load_matrix_sync(next_af, s_pi + ks * 16, 128);
+                    load_matrix_sync(next_bf, vb, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                    af = next_af;
+                    bf = next_bf;
+                }
                 mma_sync(cf, af, bf, cf);
+            } else {
+                for (int ks = 0; ks < gblk; ks++) {
+                    const int pb = block_table[seq * max_blocks + first_blk + g0 + ks];
+                    const signed char* vb = v_pool + ((size_t)pb * 16 * num_kv_heads + kvh) * HEAD_DIM + dh + warp * 16;
+                    fragment<matrix_a, 16, 16, 16, signed char, row_major> af;
+                    fragment<matrix_b, 16, 16, 16, signed char, row_major> bf;
+                    load_matrix_sync(af, s_pi + ks * 16, 128);
+                    load_matrix_sync(bf, vb, KVLD);
+                    mma_sync(cf, af, bf, cf);
+                }
             }
             store_matrix_sync(reinterpret_cast<int*>(s_s) + warp * 16, cf, 128, mem_row_major);
             __syncthreads();
